@@ -1,0 +1,456 @@
+---
+title: 'Boston Crime Analysis'
+author: "Chase Baggett"
+output:
+  html_document: 
+    code_folding: hide
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+```{r,echo=F,include=F}
+library(dplyr)
+library(ISwR)
+library(leaps)
+library(broom)
+library(ggpubr)
+library(GGally)
+library(glmnet)
+library(reshape)
+library(DT)
+library(tidyr)
+library(rpart)
+library(MASS)
+library(mclust)
+library(visNetwork)
+```
+#Introduction
+I will be attempting to model the crime rate in Boston as a response to multiple socio-economic factors. I will be using multiple statistical techniques and then comparing them to one another at the end of the project.  
+
+#Data
+
+The data comes from the MASS package.
+
+| Type      | Variable | Description                                          |
+| --------- | -------- | ---------------------------------------------------- |
+| Response  | crim     | per capita crime rate by town.  |
+| Predictor | zn       | proportion of residential land zoned for lots over 25,000 sq.ft. |
+| Predictor | indus    | proportion of non-retail business acres per town. |
+| Predictor | chas     |Charles River dummy variable (= 1 if tract bounds river; 0 otherwise). |
+| Predictor | nox | nitrogen oxides concentration (parts per 10 million). |
+| Predictor | rm | average number of rooms per dwelling. |
+| Predictor | age | proportion of owner-occupied units built prior to 1940. |
+| Predictor | dis | weighted mean of distances to five Boston employment centres. |
+| Predictor | rad | index of accessibility to radial highways. |
+| Predictor | tax |full-value property-tax rate per \$10,000. |
+| Predictor | ptratio | pupil-teacher ratio by town. |
+| Predictor | black | 1000(Bk - 0.63)^2 where Bk is the proportion of blacks by town. |
+| Predictor | lstat | lower status of the population (percent). |
+| Predictor | medv | median value of owner-occupied homes in \$1000s. |
+
+#Analyses
+
+##Train and Test
+At the very beginning, I separate into training and test tests. Because of the small size of the data, I am going to use a small test set of only 20% of the data, and leave the remaining 80% for training. 
+
+```{r, warning=F}
+set.seed(1)
+train_idx <- sample(c(TRUE,FALSE), nrow(Boston),rep=TRUE,prob = c(.8,.2))
+
+train <- Boston[train_idx,]
+test <- Boston[!train_idx,]
+```
+
+###Correlation
+Here can see how crime responds to our various predictors. For instance, I can see how as medv goes up, crime does down. This variable represents median home values. I can see a considerible difference with the naked eye up until about $150k houses. 
+
+What is very peculiar about this data, however, is the crowding of data on a few points. 
+```{r,warning=F}
+library(tidyr)
+plot_data <- gather(train,key = "crim")
+colnames(plot_data) <- c("crim","predictor","value")
+binary <- subset(plot_data,predictor=="chas")
+plot_data <- subset(plot_data,!predictor %in% c("crim","Crime_Group","HighAccess","HighTax","LogCrim"))
+non_binary <- subset(plot_data,predictor != "chas")
+non_binary$value <- as.numeric(non_binary$value)
+corr_plot <- ggplot(non_binary,aes(y=crim,x=value)) + 
+  geom_smooth(method="loess") + 
+  geom_point(alpha=.1) + 
+  facet_wrap(~predictor,scales = "free") + 
+   theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) +
+  ggtitle("Correlation of log(Crime) with Each of our Non-Binary Predictors")
+
+corr_plot
+```
+
+As I can see below, several of our variables are crowded around one value of our X predictor. This means that a linear regression fit only on this value is guaranteed to have a large amount of pure error, because for the same x value I cannot possibly predict different y values. With a multiple regression I can hope that the natural error might be decreased by other variables or interraction terms. However, it is hard to trust the accuracy of predictors like ptratio,indus,tax,zone, or rad when the most diverse set of y values lie on exactly the same x value.
+
+```{r,warning=F}
+modal.value <- function(x, na.rm = FALSE) {
+  if(na.rm){
+    x = x[!is.na(x)]
+  }
+
+  ux <- unique(x)
+  return(ux[which.max(tabulate(match(x, ux)))])
+}
+
+
+modal_values <- summarise(group_by(non_binary,predictor),
+                Modal_Value = modal.value(value),
+                Modal_Count = sum(ifelse(value==modal.value(value),1,0)),
+                Total_Values = n())
+
+modal_values$Percent_Modal <- modal_values$Modal_Count/modal_values$Total_Values                
+datatable(modal_values[order(modal_values$Percent_Modal,decreasing = T),])
+```
+
+
+I also see a lot of non-linearity in the relationships. I am going to log transform our response to attempt to improve the linear relationships.
+
+```{r}
+train$crim <- log(train$crim)
+test$crim <- log(test$crim)
+library(tidyr)
+plot_data <- gather(train,key = "crim")
+colnames(plot_data) <- c("crim","predictor","value")
+binary <- subset(plot_data,predictor=="chas")
+plot_data <- subset(plot_data,!predictor %in% c("crim","Crime_Group","HighAccess","HighTax","LogCrim"))
+non_binary <- subset(plot_data,predictor != "chas")
+non_binary$value <- as.numeric(non_binary$value)
+corr_plot <- ggplot(non_binary,aes(y=crim,x=value)) + 
+  geom_smooth(method="loess") + 
+  geom_point(alpha=.1) + 
+  facet_wrap(~predictor,scales = "free") + 
+   theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) +
+  ggtitle("Correlation of Crime with Each of our Non-Binary Predictors")
+
+corr_plot
+```
+
+##High and Low Crimes Areas
+
+Once I log the crim variable, I see that it is actually bimodal, with most zones being low crime, but some being very high crime. What I essentially see in the data is that there are two types of zones included. 
+
+```{r,warning=F}
+ggdensity(train,"crim")
+```
+
+I suspect that I might have a variable that explains the difference, so I am using a hierarchical clusteirng to separate the crime into two groups. This is largely just an exploratory step to help me understand what is causing such a wide right tail.
+
+```{r,warning=F}
+train$Crime_Group <- as.factor( cutree(hclust(dist(train$crim)),k=2) - 1)
+ggdensity(train,x="crim",color="Crime_Group")
+```
+
+Then, I can view the imbalance using a smooth between the two groups and each predictor. What I see almost immediately is that a few variables have fairly strong relationships, but that two  variables have near perfect predictive power. rad, or distance from the radial highway, provides almost perfect separation. Almost every high crime area has a value of over 20, and almost all low crime areas have a value below 10. Tax provides an almost as good classification. 
+
+```{r,warning=F}
+tail_data <- gather(train,key="Crime_Group")
+colnames(tail_data) <- c("Group","predictor","value")
+tail_data <- subset(tail_data,!predictor %in% c("crim","LogCrim"))
+ggplot(tail_data,aes(y=as.numeric(Group),x=value)) + 
+  geom_point(alpha=.1) + 
+  geom_smooth(method="loess") + 
+  facet_wrap(~predictor,scales="free")
+```
+
+Using a decision tree and only tax and rad variables, I can get nearly perfect classification of those values in the tail, versus those in the core the dataset, as can be seen by the confusion matrix below. 
+```{r,warning=F}
+dec_tree <- rpart(Crime_Group ~ rad + tax,method="class",data=train)
+pred = predict(dec_tree,type="class")
+table(pred,train$Crime_Group)
+train$Group <- predict(dec_tree,type="class")
+test$Group <- predict(dec_tree,type="class",newdata = test)
+```
+
+Why would I do this? Because I can't use the fact that an area is low or high crime in the prediction of its crime rate-- it is unknown at that point. However, I can separate areas into categories of high and low access vs tax, which might help us know which features it will exhibit. 
+
+One potential solution to this problem is usually piecewise functions that are able to treat the area with high pure error differently. However, given the simplicity of this problem and split, and how well the decision tree functions, the best approach might be to simply break apart the two groups and then interact the group with each variable. 
+
+The core of my hypothesis is that the model that performs best is the one that will know in advance what type of zone its looking at, because the relationship to response will be far more linear within a zone than across zones. So we will end up with an ensemble model that consumes our decision tree into the linear regression. 
+
+I can see below that this is reinforced by the data. In low crime areas, dis is a strong predictor, but for high crime areas, it is not. lstat is a strong predictor for both, but with a much higher slope for low crime areas. 
+
+```{r,warning=F}
+library(tidyr)
+low_crime_data <- gather(subset(train,Group==0),key = "crim")
+high_crime_data <- gather(subset(train,Group==1),key = "crim")
+colnames(low_crime_data) <- c("crim","predictor","value")
+colnames(high_crime_data) <- c("crim","predictor","value")
+low_crime_data$value <- as.numeric(low_crime_data$value)
+high_crime_data$value <- as.numeric(high_crime_data$value)
+
+p1 <- ggplot(low_crime_data,aes(y=crim,x=value)) + 
+  geom_smooth(method="loess") + 
+  geom_point(alpha=.1) + 
+  facet_wrap(~predictor,scales = "free") + 
+  ggtitle("Low Crime Zones")
+
+p2 <- ggplot(high_crime_data,aes(y=crim,x=value)) + 
+  geom_smooth(method="loess") + 
+  geom_point(alpha=.1) + 
+  facet_wrap(~predictor,scales = "free") + 
+  ggtitle("High Crime Zones")
+
+p1
+p2
+
+```
+
+```{r,warning=F}
+#cut my train back to original columns.
+train <- train[,colnames(test)]
+```
+
+##Manual Model Fit
+First,I fit a model on all of our original variables, and look at the Residuals vs Fitted Plot, and confirm my initial suspicion of bimodality.
+
+```{r,warning=F}
+fit <- lm(crim~.-Group,data=train)
+glance(fit)
+plot(fit,which=1)
+```
+
+I will do stepwise regression to trim this model to fewer predictors. The adjusted $R^2$ stays roughly the same despite removing 4 variables.
+```{r,warning=F}
+fit <- step(fit,direction = "both",trace = F)
+glance(fit)
+```
+
+However, now I want to try to use my created Group variable, which is formed via hierarchical clustering of rad and tax, and fit separate models for the two distinct groups.
+
+```{r,warning=F}
+train_0 <- subset(train,Group==0)[,!colnames(train) %in% "Group"]
+fit_0 <- lm(crim~.,data=train_0)
+
+train_1 <- subset(train,Group==1)[,!colnames(train) %in% "Group"]
+fit_1 <- lm(crim~.,data=train_1)
+```
+Fit on Low Crime Areas:
+```{r,warning=F}
+glance(fit_0)
+```
+Fit on High Crime Areas:
+```{r,warning=F}
+glance(fit_1)
+```
+
+Why is our fit so poor on low crime areas? Well, let's take a look at the data. Many of our terms look highly nonlinear, almost bending around from positive to negative slope. I am forced to believe that in large part this problem might be fundamentally non-linear. Piecewise regression, or tools like decision trees, might perform significantly better.
+
+```{r,warning=F}
+long_data <- gather(train_0,key="crim")
+colnames(long_data)[2] <- "predictor"
+ggplot(long_data,aes(y=crim,x=value)) + geom_smooth(method="loess") + geom_point(alpha=.1) + facet_wrap(~predictor,scales="free")
+```
+
+To show this, I've written a function that uses model based clustering to break a variable into logical cut points. Below I see the nox and medv variable broken like this. It is easy to see that there would be different ideal slopes in some of the different groups. 
+
+```{r,warning=F}
+piecewise_plot <- function(y,x){
+  p_data <- data.frame(y=y,x=x)
+  p_data <- p_data[order(x),]
+  
+  #Monotonically Increasing Cumulative Sum to Ensure Whole Clusters
+  p_data$g <-predict(Mclust(cumsum(abs(log(p_data$x)))))$classification
+  
+  
+  ggplot(p_data,aes(y=y,x=x,color=as.factor(g))) + geom_point() + guides(color=guide_legend(title="Group"))
+}
+piecewise_plot(train$crim,train$nox) + ggtitle("nox")
+piecewise_plot(train$crim,train$medv) + ggtitle("medv")
+```
+
+However, for my final manually constructed model, I will interact Group with our other predictors to allow the regression model to pick out the differences in slope between the high and low crime areas via our classifier which will help us know which I are dealing with ahead of time. 
+
+```{r}
+fit_group <- lm(crim~Group*(zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat + medv),data=train)
+glance(fit_group)
+```
+I will also use stepwise selection trim back the predictors in this model.
+```{r}
+fit_group <- step(fit_group,direction="both",trace = F)
+glance(fit_group)
+```
+
+##Best Subset Slection
+Best subset is viable because of how few predictors I have and how small our dataset is, so I will use it to look at the possible additive linear models. Using it, I can see that our BIC is minimized at 2 variables, but that Mallows Cp sees additional value from 3 to 4. $R^2$ and RSS are, as expected, monotonic. We'll risk a bit of overfitting and use 4 variables. 
+```{r,warning=F}
+bestsubset.fit = regsubsets(crim ~.,train)
+bestsubset.summary = summary(bestsubset.fit)
+bestsubset.overview <- data.frame(RSS=bestsubset.summary$rss,
+                                  AdjR=bestsubset.summary$adjr2,
+                                  Cp=bestsubset.summary$cp,
+                                  BIC=bestsubset.summary$bic
+                                  )
+
+bestsubset.overview$Predictors <- 1:nrow(bestsubset.overview)
+ggplot(melt(bestsubset.overview,id.vars = "Predictors"),aes(x=Predictors,y=value)) +
+  geom_line() + 
+  facet_wrap(~variable,scales = "free")
+```
+
+Here, I can see the best subset model with 3 variables includes zn, nox, rad, lstat, and the group variable I created via clustering. I will store this model and come back to it at the end for comparison to other models. 
+```{r, warning=F}
+bestsubsets.models <- as.data.frame(bestsubset.summary$which)
+bestsubsets.models[5,]
+
+bestsubset.final_model <- lm(crim ~ zn + nox + rad + lstat + Group,data=train)
+```
+
+Here I can see an overview of the model's performance.
+```{r, warning=F}
+glance(bestsubset.final_model)
+```
+As well as the coefficients.
+```{r, warning=F}
+tidy(bestsubset.final_model)
+```
+
+##Lasso Regression
+Lasso regression is similar to best subsets in that it can be used to perform variable selection by using a lambda value to reduce coefficients to zero. I will compare its selection to that of bestsubsets. I will find the best value of lambda via cross validation. 
+
+I can see that the lasso method returned different variables. Our Lasso was built with cross-validation to pick the right value of $\lambda$, whereas our subset selection was built with the training set all at once. 
+
+```{r, warning=F}
+y_train <- train$crim
+x_train <- model.matrix(crim ~.,train)
+
+y_test <- test$crim
+x_test <- model.matrix(crim ~.,test)
+
+set.seed(1)
+lasso.fit = glmnet(x_train,y_train,alpha=1)
+lasso.cvfit = cv.glmnet(x_train,y_train,alpha=1)
+lasso.coef = predict(lasso.fit,type = "coefficients",s = lasso.cvfit$lambda.min)
+datatable(data.frame(name = lasso.coef@Dimnames[[1]][lasso.coef@i + 1], 
+           coefficient = lasso.coef@x))
+``` 
+I can visualize the lambda we've chosen, with the minimum lambda as a solid line, and one standard error lambda as a dashed line. 
+```{r, warning=F}
+lasso.tidy <- tidy(lasso.cvfit)
+lasso.glance <- glance(lasso.cvfit)
+ggplot(lasso.tidy, aes(lambda, estimate)) + geom_line(color = "red") +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .2) +
+    scale_x_log10() +
+    geom_vline(xintercept = lasso.glance$lambda.min) +
+    geom_vline(xintercept = lasso.glance$lambda.1se, lty = 2)
+```
+
+##Ridge Regression
+Unlike lasso and best subset, ridge regression cannot be used for outright variable selection on its own, as the ridge will reduce the coefficients near sometimes, but never actually to zero. Ridge should be expected to be more logical for designed experiments where there is a strong first principle reason to believe most of the predictors have an effect on the response. 
+
+I will fit a ridge regression to the training set and compare it to lasso and best subset. I will see that every variable remains in the model. In fact, age, which was dropped by both of the other models, ends up with the second largest coefficient by absolute value. 
+
+```{r, warning=F}
+set.seed(1)
+ridge.fit = glmnet(x_train,y_train,alpha=0)
+ridge.cvfit=cv.glmnet(x_train,y_train,alpha=0)
+ridge.coef = coef(ridge.fit,s=ridge.cvfit$lambda.min)
+datatable(data.frame(name = ridge.coef@Dimnames[[1]][ridge.coef@i + 1], 
+           coefficient = ridge.coef@x))
+```
+I will also visualize the lambda selection for ridge regression.
+
+```{r,warning=F}
+ridge.tidy <- tidy(ridge.cvfit)
+ridge.glance <- glance(ridge.cvfit)
+ggplot(ridge.tidy, aes(lambda, estimate)) + geom_line(color = "red") +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .2) +
+    scale_x_log10() +
+    geom_vline(xintercept = ridge.glance$lambda.min) +
+    geom_vline(xintercept = ridge.glance$lambda.1se, lty = 2)
+```
+
+##Regression Tree
+
+Because I see a few complex changes in direction of the linear trend, I want to try a regression tree as a solution to this problem. Because the tree will fit multiple models, it should be able to treat parts of our data differently, and I believe will perform significantly better on this type of problem. I have a fundamentally non-linear problem wherein a few of our zones are considerably different than the others.  
+
+I can see right off the bat the tree is picking up on the fact that there's an imbalance, only 6% of our records go down the right path of the tree. 
+
+```{r}
+tree.fit <- rpart(crim~.,data=train,method="anova")
+visTree(tree.fit)
+```
+
+I can also see that a large amount of the error is corrected by the first split alone. After that, I continue, however, to get marginal cross-validated benefit from every split, though very little benefit near the last few splits. 
+
+```{r}
+rsq.rpart(tree.fit)
+```
+
+I can perform cross validation on our tree and automatically prune the tree based on that cross-validation.
+```{r}
+plotcp(tree.fit)
+unpruned <- tree.fit
+tree.fit <- prune(tree.fit, cp=tree.fit$cptable[which.min(tree.fit$cptable[,"xerror"]),"CP"])
+```
+
+However, every variable is found valuable during cross-validation, so the tree does not change. 
+
+```{r}
+visTree(tree.fit)
+```
+
+
+#Conclusion
+
+Now, I am going to take each of the 3 models and test them against our test set that I have not yet looked at. 
+
+```{r,warning=F}
+test$BestSubset <- predict(bestsubset.final_model, newdata = test)
+test$Lasso <-
+predict(lasso.fit, newx = x_test, s = lasso.cvfit$lambda.min)
+test$Ridge <-
+predict(ridge.fit, newx = x_test, s = ridge.cvfit$lambda.min)
+test$`Full Model` <- predict(fit, newdata = test)
+test$`Grouped Interraction` <- predict(fit_group, newdata = test)
+test$`Regression Tree` <- predict(tree.fit, newdata = test)
+test$`Unpruned Tree` <- predict(unpruned,newdata=test)
+results <-
+test[, c(
+"crim",
+"BestSubset",
+"Lasso",
+"Ridge",
+"Full Model",
+"Grouped Interraction",
+"Regression Tree",
+"Unpruned Tree"
+)]
+results <- gather(results, key = "crim")
+colnames(results)[2] <- "model"
+results$squared_error <- (results$value - results$crim) ^ 2
+final <- summarise(group_by(results, model), MSE = mean(squared_error))
+final <- final[order(final$MSE),]
+datatable(final)
+```
+
+
+
+In the end, the model that is the grouped interraction worked best, with the regression tree very close. Both models that were able to separate high and low crime areas and treat them differently overperformed the linear regression techniques regardless of how they estimated coefficients or selected predictors.
+
+##Final Model
+
+###High or Low Crime Predictor
+The group variable is defined by the training set and then predicted upon the test set before final prediction, using hierarchical clustering via euclidian distance and the "complete" agglomeration method. We use the training set to build a model that predicts this grouping on the training set using a decision tree using only the rad and tax variables. 
+
+###Final Model
+The final model then becomes an ensemble model that consumes the High or Low Crime Prediction model. This model is more complex than a simple linear regression, but due to the bimodality of the data I believe it will always outperform pure linear regression-- though with enough data, I believe gradient boosted or random forest regression trees could outperform my model by performing more natural breaks in the modality and finding more complex interractions. However, without more data, these techniques risk of considerible overfitting. 
+
+
+The winning model, thus, is:
+```{r}
+fit_group$call
+```
+
+with the coeffients:
+
+```{r}
+tidy(fit_group)
+```
